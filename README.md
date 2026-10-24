@@ -23,11 +23,13 @@ the post, and gives agents tools to list alerts and manage silences.
 
   | Tool | Kind | What it does |
   |---|---|---|
-  | `list_alerts` `{instance?, receiver?, filter?, active?, silenced?, inhibited?}` | read | Alerts of the receivers routed to channels the person can read. |
-  | `list_silences` `{instance?, filter?}` | read | Active and pending silences of the instances routed to a channel the person can read. |
-  | `create_silence` `{instance?, matchers, duration, comment}` | external write | A silence of up to 30 days. Needs the silence right in every channel the instance is routed to. |
-  | `expire_silence` `{instance?, id}` | external write | Ends a silence. A silence set from an alert post needs the right in that post's channel; any other, in every channel the instance is routed to. |
+  | `list_alerts` `{alertmanager?, receiver?, target?, filter?, active?, silenced?, inhibited?}` | read | Alerts of the receivers routed to channels the person can read; `target` keeps those about one host (instance label, with or without its port, or job). |
+  | `list_silences` `{alertmanager?, filter?}` | read | Active and pending silences of the instances routed to a channel the person can read. |
+  | `create_silence` `{alertmanager?, matchers, duration, comment}` | external write | A silence of up to 30 days. Needs the silence right in every channel the instance is routed to. |
+  | `expire_silence` `{alertmanager?, id}` | external write | Ends a silence. A silence set from an alert post needs the right in that post's channel; any other, in every channel the instance is routed to. |
 
+  `alertmanager` names the Alertmanager instance. Without it, the read tools look at every instance the
+  person can see, and the write tools work on the only one they can see (with several, they must name it).
   The server asks the person to confirm the two write tools; the app checks their right all the same.
   Results are compact JSON with a `title` and a `summary`.
 

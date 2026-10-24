@@ -120,7 +120,7 @@ func TestListAlertsTool(t *testing.T) {
 	assert.Equal(t, []string{"^(?:db)$"}, last.Query["receiver"])
 
 	// The instance must be one the person can see.
-	assert.Equal(t, errUnknownInstance.Error(), env.tool(member, toolListAlerts, map[string]any{"instance": "staging"}).Error)
+	assert.Equal(t, errUnknownInstance.Error(), env.tool(member, toolListAlerts, map[string]any{"alertmanager": "staging"}).Error)
 	env.api.mu.Lock()
 	delete(env.api.teamMembers[teamID], outsider)
 	env.api.mu.Unlock()
@@ -284,4 +284,146 @@ func TestParseSilenceDuration(t *testing.T) {
 		_, err := parseSilenceDuration(text)
 		assert.Error(t, err, text)
 	}
+}
+
+// addInstance adds an Alertmanager instance routed, like prod, to ops/alerts by community and channel name.
+func (env *testEnv) addInstance(name string) *fakeAM {
+	env.t.Helper()
+	am := newFakeAM(env.t)
+	var instances []instanceConfig
+	require.NoError(env.t, json.Unmarshal([]byte(env.api.config.Instances), &instances))
+	instances = append(instances, instanceConfig{Name: name, URL: am.server.URL, Routes: []routeConfig{{Receiver: "antimatter", Team: "ops", Channel: "alerts"}}})
+	secrets := map[string]instanceSecretConfig{}
+	require.NoError(env.t, json.Unmarshal([]byte(env.api.config.InstanceSecrets), &secrets))
+	secrets[name] = instanceSecretConfig{WebhookSecret: testSecret}
+	env.api.config.Instances = string(mustJSON(env.t, instances))
+	env.api.config.InstanceSecrets = string(mustJSON(env.t, secrets))
+	require.NoError(env.t, env.p.OnConfigurationChange())
+	return am
+}
+
+// A route given by community and channel name is visible to the members of that channel, with the instance named
+// or not, and resolves to the channel the webhook posts in. Seen on amdev: a system admin member of the routed
+// channel was told there was no instance she could see.
+func TestRouteByNamesIsVisibleToMembers(t *testing.T) {
+	env := newTestEnv(t)
+	env.am.alerts = sampleAlerts()
+	env.postAlert(firingPayload("g1", "antimatter", highCPU(statusFiring)))
+	require.Len(t, env.rootPosts(), 1)
+	require.Equal(t, alertsChannel, env.rootPosts()[0].ChannelId, "the webhook posts in ops/alerts")
+
+	for _, userID := range []string{sysadmin, member, channelAdmin} {
+		for _, args := range []map[string]any{{}, {"alertmanager": "prod"}} {
+			alerts := decodeResult[alertsResult](t, env.tool(userID, toolListAlerts, args))
+			assert.Equal(t, "Alerts of prod", alerts.Title)
+			assert.NotEmpty(t, alerts.Alerts)
+			silences := decodeResult[silencesResult](t, env.tool(userID, toolListSilences, args))
+			assert.Equal(t, "Silences of prod", silences.Title)
+		}
+	}
+
+	// Someone outside the channel and its community sees nothing, named or not.
+	env.api.mu.Lock()
+	delete(env.api.teamMembers[teamID], outsider)
+	env.api.mu.Unlock()
+	for _, args := range []map[string]any{{}, {"alertmanager": "prod"}} {
+		assert.Equal(t, errUnknownInstance.Error(), env.tool(outsider, toolListAlerts, args).Error)
+		assert.Equal(t, errUnknownInstance.Error(), env.tool(outsider, toolListSilences, args).Error)
+	}
+}
+
+// The channel of a route is looked up on every call: a lookup that failed once (the channel not made yet, a typo
+// fixed since) isn't remembered.
+func TestFailedRouteLookupIsNotKept(t *testing.T) {
+	env := newTestEnv(t)
+	env.api.mu.Lock()
+	delete(env.api.byName, "ops/alerts")
+	env.api.mu.Unlock()
+	assert.Equal(t, errUnknownInstance.Error(), env.tool(member, toolListAlerts, map[string]any{}).Error)
+
+	env.api.mu.Lock()
+	env.api.byName["ops/alerts"] = alertsChannel
+	env.api.mu.Unlock()
+	out := decodeResult[alertsResult](t, env.tool(member, toolListAlerts, map[string]any{}))
+	assert.Equal(t, "Alerts of prod", out.Title)
+}
+
+// The assistant fills the properties named like a host with the host a message names: "is www-1 down?" gives a
+// target, never the name of an Alertmanager instance.
+func TestHostIsATargetNotAnInstance(t *testing.T) {
+	env := newTestEnv(t)
+	env.am.alerts = sampleAlerts()
+	env.am.alerts[0].Labels["instance"] = "www-1:9100"
+
+	for _, d := range env.api.tools {
+		var schema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		}
+		require.NoError(t, json.Unmarshal(d.InputSchema, &schema), d.Name)
+		assert.Contains(t, schema.Properties, "alertmanager", d.Name)
+		for _, hostLike := range []string{"instance", "host", "hostname", "node", "server", "machine"} {
+			assert.NotContains(t, schema.Properties, hostLike, d.Name)
+		}
+	}
+
+	out := decodeResult[alertsResult](t, env.tool(sysadmin, toolListAlerts, map[string]any{"target": "WWW-1"}))
+	require.Len(t, out.Alerts, 1)
+	assert.Equal(t, "HighCPU", out.Alerts[0].Name)
+	assert.Equal(t, "1 firing (1 critical).", out.Summary)
+
+	out = decodeResult[alertsResult](t, env.tool(sysadmin, toolListAlerts, map[string]any{"target": "www-9"}))
+	assert.Empty(t, out.Alerts)
+
+	// An alert without an instance label is about its job.
+	assert.True(t, aboutTarget(map[string]string{"job": "node"}, "node"))
+	assert.False(t, aboutTarget(map[string]string{"instance": "www-10"}, "www-1"))
+
+	// The old argument is refused rather than taken for an instance name.
+	assert.Contains(t, env.tool(sysadmin, toolListAlerts, map[string]any{"instance": "www-1"}).Error, "arguments aren't valid")
+	assert.Equal(t, errBadTarget.Error(), env.tool(sysadmin, toolListAlerts, map[string]any{"target": "a\nb"}).Error)
+}
+
+// With several instances, the read tools look at every one the person can see when none is named, and the action
+// tools need the name.
+func TestSeveralInstances(t *testing.T) {
+	env := newTestEnv(t)
+	env.am.alerts = sampleAlerts()
+	staging := env.addInstance("staging")
+	staging.alerts = []amAlert{{
+		Labels: map[string]string{"alertname": "HighLatency", "instance": "www-3", "severity": "warning"}, Receivers: []amReceiver{{Name: "antimatter"}},
+		Status: amAlertStatus{State: "active"},
+	}}
+
+	out := decodeResult[alertsResult](t, env.tool(member, toolListAlerts, map[string]any{}))
+	assert.Equal(t, "Alerts", out.Title)
+	byInstance := map[string]int{}
+	for _, a := range out.Alerts {
+		byInstance[a.Instance]++
+	}
+	assert.Equal(t, map[string]int{"prod": 2, "staging": 1}, byInstance)
+	require.Len(t, env.am.calls(), 1)
+	require.Len(t, staging.calls(), 1)
+
+	silences := decodeResult[silencesResult](t, env.tool(member, toolListSilences, map[string]any{}))
+	assert.Equal(t, "Silences", silences.Title)
+	require.Len(t, env.am.calls(), 2)
+	require.Len(t, staging.calls(), 2)
+
+	only := decodeResult[alertsResult](t, env.tool(member, toolListAlerts, map[string]any{"alertmanager": "staging"}))
+	assert.Equal(t, "Alerts of staging", only.Title)
+	require.Len(t, only.Alerts, 1)
+	assert.Len(t, env.am.calls(), 2, "prod isn't asked")
+
+	create := map[string]any{"matchers": []map[string]any{{"name": "alertname", "value": "HighCPU"}}, "duration": "1h", "comment": "x"}
+	result := env.tool(sysadmin, toolCreateSilence, create)
+	assert.Equal(t, errNameInstance.Error()+": prod, staging", result.Error)
+	assert.Contains(t, env.tool(sysadmin, toolExpireSilence, map[string]any{"id": "x"}).Error, errNameInstance.Error())
+	assert.Empty(t, env.am.writes())
+	assert.Empty(t, staging.writes())
+
+	create["alertmanager"] = "staging"
+	created := decodeResult[silenceResult](t, env.tool(sysadmin, toolCreateSilence, create))
+	assert.Equal(t, "staging", created.Instance)
+	assert.Len(t, staging.writes(), 1)
+	assert.Empty(t, env.am.writes())
 }

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"regexp"
 	"slices"
 	"strconv"
@@ -46,13 +47,17 @@ var labelNamePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,99}$`)
 
 var (
 	errUnknownInstance   = errors.New("there's no Alertmanager instance of that name that you can see")
-	errNameInstance      = errors.New("name the Alertmanager instance")
+	errNameInstance      = errors.New("name the Alertmanager instance in the alertmanager argument")
 	errUnknownReceiver   = errors.New("there's no receiver of that name that you can see")
 	errNoInstanceSilence = errors.New("you may not silence alerts of this Alertmanager instance: it needs the silence right in every channel the instance is routed to")
 	errNoSuchSilence     = errors.New("there's no silence with that ID")
+	errBadTarget         = errors.New("the target isn't a host or target name")
 )
 
-const instanceProperty = `"instance": {"type": "string", "description": "The name of the Alertmanager instance. Optional when there's only one."}`
+// instanceProperty names the Alertmanager instance a tool works on. It isn't called "instance": the assistant fills
+// the properties named like a host (instance, host, target...) with the host a message talks about, such as "www-1"
+// in "is www-1 down?", which is never the name of an Alertmanager instance.
+const instanceProperty = `"alertmanager": {"type": "string", "description": "The name of the Alertmanager instance (not a host). Optional: the read tools then look at every instance the person can see, and the other tools need it only when there are several."}`
 
 // aiToolDefinitions gives the app's tools.
 func aiToolDefinitions() []*model.AIToolDefinition {
@@ -65,6 +70,7 @@ func aiToolDefinitions() []*model.AIToolDefinition {
 			Kind: model.AIToolKindRead,
 			InputSchema: json.RawMessage(`{"type": "object", "properties": {` + instanceProperty + `,
 				"receiver": {"type": "string", "description": "Only the alerts sent to this Alertmanager receiver."},
+				"target": {"type": "string", "description": "Only the alerts about this host or target: their instance label, with or without its port, or else their job."},
 				"filter": {"type": "array", "items": {"type": "string"}, "description": "Alertmanager label matchers, such as alertname=\"HighCPU\" or instance=~\"www-.*\"."},
 				"active": {"type": "boolean", "description": "Include active alerts (default true)."},
 				"silenced": {"type": "boolean", "description": "Include silenced alerts (default true)."},
@@ -141,8 +147,9 @@ func checkFilters(filter stringList) error {
 }
 
 type listAlertsArgs struct {
-	Instance  string     `json:"instance"`
+	Instance  string     `json:"alertmanager"`
 	Receiver  string     `json:"receiver"`
+	Target    string     `json:"target"`
 	Filter    stringList `json:"filter"`
 	Active    *bool      `json:"active"`
 	Silenced  *bool      `json:"silenced"`
@@ -150,7 +157,7 @@ type listAlertsArgs struct {
 }
 
 type listSilencesArgs struct {
-	Instance string     `json:"instance"`
+	Instance string     `json:"alertmanager"`
 	Filter   stringList `json:"filter"`
 }
 
@@ -162,21 +169,21 @@ type toolMatcher struct {
 }
 
 type createSilenceArgs struct {
-	Instance string        `json:"instance"`
+	Instance string        `json:"alertmanager"`
 	Matchers []toolMatcher `json:"matchers"`
 	Duration string        `json:"duration"`
 	Comment  string        `json:"comment"`
 }
 
 type expireSilenceArgs struct {
-	Instance string `json:"instance"`
+	Instance string `json:"alertmanager"`
 	ID       string `json:"id"`
 }
 
 // The results: compact, with a title and a short summary for the assistant's cards.
 
 type toolAlert struct {
-	Instance  string            `json:"instance,omitempty"`
+	Instance  string            `json:"alertmanager,omitempty"`
 	Name      string            `json:"alertname"`
 	Target    string            `json:"target,omitempty"`
 	Severity  string            `json:"severity,omitempty"`
@@ -196,7 +203,7 @@ type alertsResult struct {
 }
 
 type toolSilence struct {
-	Instance  string `json:"instance,omitempty"`
+	Instance  string `json:"alertmanager,omitempty"`
 	ID        string `json:"id"`
 	State     string `json:"state"`
 	Matchers  string `json:"matchers"`
@@ -216,7 +223,7 @@ type silencesResult struct {
 type silenceResult struct {
 	Title    string `json:"title"`
 	Summary  string `json:"summary"`
-	Instance string `json:"instance"`
+	Instance string `json:"alertmanager"`
 	ID       string `json:"id"`
 	Matchers string `json:"matchers,omitempty"`
 	EndsAt   string `json:"ends_at,omitempty"`
@@ -371,6 +378,10 @@ func (p *Plugin) toolListAlerts(ctx context.Context, s *settings, userID string,
 	if err := checkFilters(args.Filter); err != nil {
 		return nil, err
 	}
+	args.Target = strings.TrimSpace(args.Target)
+	if len(args.Target) > maxFilterLength || strings.ContainsAny(args.Target, "\r\n") {
+		return nil, errBadTarget
+	}
 	instances, receivers, err := p.readableInstances(s, userID, args.Instance)
 	if err != nil {
 		return nil, err
@@ -405,7 +416,8 @@ func (p *Plugin) toolListAlerts(ctx context.Context, s *settings, userID string,
 					visible = append(visible, r.Name)
 				}
 			}
-			if len(visible) == 0 || (!s.postSeverityNone && strings.EqualFold(a.Labels["severity"], "none")) {
+			if len(visible) == 0 || (!s.postSeverityNone && strings.EqualFold(a.Labels["severity"], "none")) ||
+				(args.Target != "" && !aboutTarget(a.Labels, args.Target)) {
 				continue
 			}
 			state := a.Status.State
@@ -449,6 +461,22 @@ func (p *Plugin) toolListAlerts(ctx context.Context, s *settings, userID string,
 	}
 	result.Summary = alertsSummary(firing, silenced, inhibited, severities)
 	return result, nil
+}
+
+// aboutTarget tells whether an alert is about a host or target: its instance label, with or without the port, or
+// else its job, as alertTarget shows it.
+func aboutTarget(labels map[string]string, target string) bool {
+	instance := labels["instance"]
+	if instance == "" {
+		return strings.EqualFold(labels["job"], target)
+	}
+	if strings.EqualFold(instance, target) {
+		return true
+	}
+	if host, _, err := net.SplitHostPort(instance); err == nil {
+		return strings.EqualFold(host, target)
+	}
+	return false
 }
 
 // compactLabels gives an alert's labels without the ones shown on their own, at most maxToolLabels.
