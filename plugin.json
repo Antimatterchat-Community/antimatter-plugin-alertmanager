@@ -1,0 +1,71 @@
+{
+    "id": "com.antimatterchat.alertmanager",
+    "name": "Alertmanager",
+    "description": "Posts Prometheus Alertmanager alerts in channels, lets people silence them from the post, and gives agents tools to list alerts and manage silences.",
+    "homepage_url": "https://github.com/Antimatterchat-Community/antimatter-plugin-alertmanager",
+    "support_url": "https://github.com/AntimatterChat/community/issues",
+    "icon_path": "assets/icon.svg",
+    "version": "0.1.0",
+    "min_server_version": "11.11.0",
+    "server": {
+        "executables": {
+            "darwin-amd64": "server/dist/plugin-darwin-amd64",
+            "darwin-arm64": "server/dist/plugin-darwin-arm64",
+            "linux-amd64": "server/dist/plugin-linux-amd64",
+            "linux-arm64": "server/dist/plugin-linux-arm64",
+            "windows-amd64": "server/dist/plugin-windows-amd64.exe"
+        },
+        "executable": ""
+    },
+    "settings_schema": {
+        "header": "Connect one or more Alertmanager instances. Each instance sends its alerts to this app's webhook, https://<your server>/plugins/com.antimatterchat.alertmanager/webhook/<instance name>/<webhook secret>, and the app's bot posts them in the channels its routes name.",
+        "footer": "",
+        "settings": [
+            {
+                "key": "Instances",
+                "display_name": "Alertmanager instances",
+                "type": "longtext",
+                "default": "[]",
+                "placeholder": "[{\"name\": \"prod\", \"url\": \"http://alertmanager:9093\", \"routes\": [{\"receiver\": \"antimatter\", \"team\": \"ops\", \"channel\": \"alerts\"}]}]",
+                "help_text": "A JSON list of instances. Each has a \"name\" (letters, digits, \"-\" and \"_\", used in its webhook address), the \"url\" of its Alertmanager (private addresses are allowed, link-local and cloud metadata addresses are not), and \"routes\": each maps a \"receiver\" of Alertmanager's configuration to a channel, either by \"team\" (the community's name, as in its address) and \"channel\" (the channel's name, as in its address) or by \"channel_id\". Alerts for receivers without a route are ignored. Passwords, tokens and webhook secrets go in the setting below, not here."
+            },
+            {
+                "key": "InstanceSecrets",
+                "display_name": "Instance secrets",
+                "type": "longtext",
+                "secret": true,
+                "default": "{}",
+                "placeholder": "{\"prod\": {\"webhook_secret\": \"a long random string\", \"bearer_token\": \"...\"}}",
+                "help_text": "A JSON object with, for each instance name, its \"webhook_secret\" (required, at least 24 characters: put it at the end of the webhook address in Alertmanager's configuration) and, if its Alertmanager needs a sign-in, either \"username\" and \"password\" (basic auth) or \"bearer_token\". This setting is never shown again or sent to anyone's browser."
+            },
+            {
+                "key": "SilencePermission",
+                "display_name": "Who may silence alerts",
+                "type": "dropdown",
+                "default": "channel_admins",
+                "options": [
+                    {
+                        "display_name": "Channel admins and community admins",
+                        "value": "channel_admins"
+                    },
+                    {
+                        "display_name": "Anyone who can post in the channel",
+                        "value": "channel_posters"
+                    },
+                    {
+                        "display_name": "System admins only",
+                        "value": "system_admins"
+                    }
+                ],
+                "help_text": "Who may silence and expire silences, from an alert's post in the channel its receiver is routed to, or with the agents' tools. System admins may always, provided they're members of the channel. With the agents' tools, a silence can match any alert of the instance, so it needs this right in every channel the instance is routed to."
+            },
+            {
+                "key": "PostSeverityNone",
+                "display_name": "Post alerts with severity \"none\"",
+                "type": "bool",
+                "default": false,
+                "help_text": "When false, alerts labelled severity=\"none\", such as the always-firing Watchdog alert, aren't posted."
+            }
+        ]
+    }
+}

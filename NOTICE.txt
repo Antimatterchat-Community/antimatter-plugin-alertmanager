@@ -1,0 +1,12 @@
+Antimatter Alertmanager app
+
+Copyright (c) 2026-present Antimatter contributors. Licensed under the Apache License, Version 2.0,
+see LICENSE.
+
+NOTICES:
+--------
+
+The build tooling (Makefile, build/) is derived from mattermost-plugin-gitlab
+(https://github.com/mattermost/mattermost-plugin-gitlab), Copyright (c) 2019-present Mattermost, Inc.,
+licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0). The copied
+files keep their original copyright headers.

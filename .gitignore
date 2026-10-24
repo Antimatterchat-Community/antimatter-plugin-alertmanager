@@ -31,3 +31,14 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Antimatter app build
+bin/
+dist/
+server/dist/
+server/manifest.go
+.gotmp/
+report.xml
+
+# Mac
+.DS_Store
