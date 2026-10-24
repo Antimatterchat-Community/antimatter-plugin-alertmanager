@@ -31,7 +31,8 @@ the post, and gives agents tools to list alerts and manage silences.
   `alertmanager` names the Alertmanager instance. Without it, the read tools look at every instance the
   person can see, and the write tools work on the only one they can see (with several, they must name it).
   The server asks the person to confirm the two write tools; the app checks their right all the same.
-  Results are compact JSON with a `title` and a `summary`.
+  `list_alerts` and `list_silences` give message attachments (the same card format the app's own alert
+  posts use) plus a plain-text `summary`; the write tools' confirmations stay plain text with a `summary`.
 
 ## Installation
 

@@ -33,13 +33,11 @@ const (
 	toolExpireSilence = "expire_silence"
 
 	toolTimeout      = 60 * time.Second
-	maxToolAlerts    = 50
 	maxToolSilences  = 50
 	maxToolFilters   = 10
 	maxFilterLength  = 200
 	maxToolMatchers  = 16
 	maxMatcherValue  = 1024
-	maxToolLabels    = 16
 	maxToolTextRunes = 300
 )
 
@@ -180,45 +178,10 @@ type expireSilenceArgs struct {
 	ID       string `json:"id"`
 }
 
-// The results: compact, with a title and a short summary for the assistant's cards.
-
-type toolAlert struct {
-	Instance  string            `json:"alertmanager,omitempty"`
-	Name      string            `json:"alertname"`
-	Target    string            `json:"target,omitempty"`
-	Severity  string            `json:"severity,omitempty"`
-	State     string            `json:"state"`
-	Summary   string            `json:"summary,omitempty"`
-	StartsAt  string            `json:"starts_at,omitempty"`
-	Receivers []string          `json:"receivers,omitempty"`
-	Labels    map[string]string `json:"labels,omitempty"`
-	URL       string            `json:"url,omitempty"`
-}
-
-type alertsResult struct {
-	Title   string      `json:"title"`
-	Summary string      `json:"summary"`
-	Alerts  []toolAlert `json:"alerts"`
-	More    int         `json:"more,omitempty"`
-}
-
-type toolSilence struct {
-	Instance  string `json:"alertmanager,omitempty"`
-	ID        string `json:"id"`
-	State     string `json:"state"`
-	Matchers  string `json:"matchers"`
-	StartsAt  string `json:"starts_at,omitempty"`
-	EndsAt    string `json:"ends_at"`
-	CreatedBy string `json:"created_by,omitempty"`
-	Comment   string `json:"comment,omitempty"`
-}
-
-type silencesResult struct {
-	Title    string        `json:"title"`
-	Summary  string        `json:"summary"`
-	Silences []toolSilence `json:"silences"`
-	More     int           `json:"more,omitempty"`
-}
+// The results: compact, for the assistant's cards. list_alerts and list_silences give message
+// attachments, in the same format the app's own alert posts use (render.go), plus a plain-text
+// summary (display.go's toolDisplayResult). The action tools below keep their own plain
+// confirmation shape: they report what was done, not something to show as a card.
 
 type silenceResult struct {
 	Title    string `json:"title"`
@@ -374,7 +337,7 @@ func (p *Plugin) actionInstance(s *settings, userID, name string) (*instance, er
 	return instances[0], nil
 }
 
-func (p *Plugin) toolListAlerts(ctx context.Context, s *settings, userID string, args *listAlertsArgs) (*alertsResult, error) {
+func (p *Plugin) toolListAlerts(ctx context.Context, s *settings, userID string, args *listAlertsArgs) (*toolDisplayResult, error) {
 	if err := checkFilters(args.Filter); err != nil {
 		return nil, err
 	}
@@ -399,8 +362,9 @@ func (p *Plugin) toolListAlerts(ctx context.Context, s *settings, userID string,
 		instances = kept
 	}
 
-	result := &alertsResult{Alerts: []toolAlert{}}
-	firing, silenced, inhibited := 0, 0, 0
+	now := p.now()
+	var attachments []*model.MessageAttachment
+	total, firing, silenced, inhibited := 0, 0, 0, 0
 	severities := map[string]int{}
 	for _, inst := range instances {
 		alerts, err := inst.alerts(ctx, alertQuery{
@@ -410,23 +374,22 @@ func (p *Plugin) toolListAlerts(ctx context.Context, s *settings, userID string,
 			return nil, fmt.Errorf("instance %s: %w", inst.name, err)
 		}
 		for _, a := range alerts {
-			var visible []string
+			visible := false
 			for _, r := range a.Receivers {
 				if receivers[inst.name][r.Name] && (args.Receiver == "" || r.Name == args.Receiver) {
-					visible = append(visible, r.Name)
+					visible = true
+					break
 				}
 			}
-			if len(visible) == 0 || (!s.postSeverityNone && strings.EqualFold(a.Labels["severity"], "none")) ||
+			if !visible || (!s.postSeverityNone && strings.EqualFold(a.Labels["severity"], "none")) ||
 				(args.Target != "" && !aboutTarget(a.Labels, args.Target)) {
 				continue
 			}
-			state := a.Status.State
-			switch {
-			case len(a.Status.SilencedBy) > 0:
-				state = "silenced"
+			state := alertDisplayState(a, now)
+			switch state {
+			case alertStateSilenced:
 				silenced++
-			case len(a.Status.InhibitedBy) > 0:
-				state = "inhibited"
+			case alertStateInhibited:
 				inhibited++
 			default:
 				firing++
@@ -434,33 +397,31 @@ func (p *Plugin) toolListAlerts(ctx context.Context, s *settings, userID string,
 					severities[strings.ToLower(sev)]++
 				}
 			}
-			if len(result.Alerts) == maxToolAlerts {
-				result.More++
-				continue
+			total++
+			if len(attachments) < maxShownAlertAttachments {
+				instanceName := ""
+				if len(instances) > 1 {
+					instanceName = inst.name
+				}
+				attachments = append(attachments, alertAttachment(a, state, instanceName))
 			}
-			item := toolAlert{
-				Name:      a.Labels["alertname"],
-				Target:    alertTarget(a.Labels),
-				Severity:  a.Labels["severity"],
-				State:     state,
-				Summary:   truncateRunes(a.Annotations["summary"], maxToolTextRunes),
-				StartsAt:  formatTime(a.StartsAt),
-				Receivers: visible,
-				Labels:    compactLabels(a.Labels),
-				URL:       safeLink(a.GeneratorURL),
-			}
-			if len(instances) > 1 {
-				item.Instance = inst.name
-			}
-			result.Alerts = append(result.Alerts, item)
 		}
 	}
-	result.Title = "Alerts"
+
+	scopeName := ""
+	title := "Alerts"
 	if len(instances) == 1 {
-		result.Title = "Alerts of " + instances[0].name
+		scopeName = instances[0].name
+		title = "Alerts of " + scopeName
 	}
-	result.Summary = alertsSummary(firing, silenced, inhibited, severities)
-	return result, nil
+	if total == 0 {
+		text := noAlertsText(scopeName)
+		return &toolDisplayResult{Attachments: []*model.MessageAttachment{noItemsAttachment(text)}, Summary: text}, nil
+	}
+	if more := total - len(attachments); more > 0 {
+		attachments = append(attachments, moreAttachment(more, "alerts"))
+	}
+	return &toolDisplayResult{Attachments: attachments, Summary: title + ": " + alertsSummary(firing, silenced, inhibited, severities)}, nil
 }
 
 // aboutTarget tells whether an alert is about a host or target: its instance label, with or without the port, or
@@ -477,21 +438,6 @@ func aboutTarget(labels map[string]string, target string) bool {
 		return strings.EqualFold(host, target)
 	}
 	return false
-}
-
-// compactLabels gives an alert's labels without the ones shown on their own, at most maxToolLabels.
-func compactLabels(labels map[string]string) map[string]string {
-	out := map[string]string{}
-	for _, name := range slices.Sorted(maps.Keys(labels)) {
-		if name == "alertname" || name == "severity" || len(out) == maxToolLabels {
-			continue
-		}
-		out[name] = truncateRunes(labels[name], 200)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 func alertsSummary(firing, silenced, inhibited int, severities map[string]int) string {
@@ -523,7 +469,7 @@ func matchersText(matchers []amMatcher) string {
 	return strings.Join(parts, ", ")
 }
 
-func (p *Plugin) toolListSilences(ctx context.Context, s *settings, userID string, args *listSilencesArgs) (*silencesResult, error) {
+func (p *Plugin) toolListSilences(ctx context.Context, s *settings, userID string, args *listSilencesArgs) (*toolDisplayResult, error) {
 	if err := checkFilters(args.Filter); err != nil {
 		return nil, err
 	}
@@ -531,8 +477,9 @@ func (p *Plugin) toolListSilences(ctx context.Context, s *settings, userID strin
 	if err != nil {
 		return nil, err
 	}
-	result := &silencesResult{Silences: []toolSilence{}}
-	active, pending := 0, 0
+	type row struct{ matchers, until, by, comment string }
+	var rows []row
+	active, pending, total := 0, 0, 0
 	for _, inst := range instances {
 		silences, err := inst.silences(ctx, args.Filter)
 		if err != nil {
@@ -548,40 +495,62 @@ func (p *Plugin) toolListSilences(ctx context.Context, s *settings, userID strin
 			default:
 				continue
 			}
-			if len(result.Silences) == maxToolSilences {
-				result.More++
+			total++
+			if len(rows) == maxToolSilences {
 				continue
 			}
-			item := toolSilence{
-				ID:        sil.ID,
-				State:     sil.Status.State,
-				Matchers:  truncateRunes(matchersText(sil.Matchers), maxToolTextRunes),
-				EndsAt:    formatTime(sil.EndsAt),
-				CreatedBy: truncateRunes(sil.CreatedBy, 100),
-				Comment:   truncateRunes(sil.Comment, 200),
-			}
+			until := formatTime(sil.EndsAt)
 			if sil.Status.State == "pending" {
-				item.StartsAt = formatTime(sil.StartsAt)
+				until = "from " + formatTime(sil.StartsAt) + " until " + until
 			}
+			by := truncateRunes(sil.CreatedBy, 100)
 			if len(instances) > 1 {
-				item.Instance = inst.name
+				by = strings.TrimSpace(by + " (" + inst.name + ")")
 			}
-			result.Silences = append(result.Silences, item)
+			rows = append(rows, row{
+				matchers: truncateRunes(matchersText(sil.Matchers), maxToolTextRunes),
+				until:    until,
+				by:       by,
+				comment:  truncateRunes(sil.Comment, 200),
+			})
 		}
 	}
-	result.Title = "Silences"
+
+	title := "Silences"
 	if len(instances) == 1 {
-		result.Title = "Silences of " + instances[0].name
+		title = "Silences of " + instances[0].name
 	}
+	var countSummary string
 	switch {
 	case active+pending == 0:
-		result.Summary = "No active silences."
+		countSummary = "No active silences."
 	case pending == 0:
-		result.Summary = fmt.Sprintf("%d active.", active)
+		countSummary = fmt.Sprintf("%d active.", active)
 	default:
-		result.Summary = fmt.Sprintf("%d active, %d pending.", active, pending)
+		countSummary = fmt.Sprintf("%d active, %d pending.", active, pending)
 	}
-	return result, nil
+
+	summary := title + ": " + countSummary
+	if len(rows) == 0 {
+		att := noItemsAttachment(countSummary)
+		att.Title = title
+		return &toolDisplayResult{Attachments: []*model.MessageAttachment{att}, Summary: summary}, nil
+	}
+	tableRows := make([][]string, len(rows))
+	for i, r := range rows {
+		tableRows[i] = []string{r.matchers, r.until, r.by, r.comment}
+	}
+	text := markdownTable([]string{"Matchers", "Until", "By", "Comment"}, tableRows)
+	if more := total - len(rows); more > 0 {
+		text += fmt.Sprintf("\n\n_+%d more not shown._", more)
+	}
+	attachment := &model.MessageAttachment{
+		Fallback: summary,
+		Title:    title,
+		Text:     text,
+		Footer:   "Alertmanager",
+	}
+	return &toolDisplayResult{Attachments: []*model.MessageAttachment{attachment}, Summary: summary}, nil
 }
 
 // parseSilenceDuration reads a duration: Go's (90m, 2h30m) with days (d) and weeks (w) too.

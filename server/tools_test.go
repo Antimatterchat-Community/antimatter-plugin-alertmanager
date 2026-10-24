@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -82,17 +83,19 @@ func TestListAlertsTool(t *testing.T) {
 	env.am.alerts = sampleAlerts()
 
 	// dbAdmin reads both channels.
-	out := decodeResult[alertsResult](t, env.tool(dbAdmin, toolListAlerts, map[string]any{"filter": []string{`severity=~"critical|warning"`}, "active": true}))
-	assert.Equal(t, "Alerts of prod", out.Title)
-	assert.Equal(t, "2 firing (1 critical, 1 warning), 1 silenced.", out.Summary)
-	require.Len(t, out.Alerts, 3)
-	first := out.Alerts[0]
-	assert.Equal(t, toolAlert{
-		Name: "HighCPU", Target: "www-1", Severity: "critical", State: "active", Summary: "CPU above 90% on www-1",
-		StartsAt: "2026-10-24 17:55 UTC", Receivers: []string{"antimatter"},
-		Labels: map[string]string{"instance": "www-1", "job": "node"}, URL: "http://prometheus:9090/graph",
-	}, first)
-	assert.Equal(t, "silenced", out.Alerts[2].State)
+	out := decodeResult[toolDisplayResult](t, env.tool(dbAdmin, toolListAlerts, map[string]any{"filter": []string{`severity=~"critical|warning"`}, "active": true}))
+	assert.Equal(t, "Alerts of prod: 2 firing (1 critical, 1 warning), 1 silenced.", out.Summary)
+	require.Len(t, out.Attachments, 3)
+	first := out.Attachments[0]
+	assert.Equal(t, "HighCPU", first.Title)
+	assert.Equal(t, "CPU above 90% on www-1", first.Text)
+	assert.Equal(t, "http://prometheus:9090/graph", first.TitleLink)
+	assert.Equal(t, fieldValue(t, first, "Severity"), "critical")
+	assert.Equal(t, fieldValue(t, first, "Target"), "www-1")
+	assert.Equal(t, fieldValue(t, first, "Since"), "2026-10-24 17:55 UTC")
+	assert.Equal(t, "danger", first.Color)
+	assert.Equal(t, "good", toolAlertColour(statusResolved, "critical"), "sanity: resolved is always green")
+	assert.Equal(t, "#8b8f97", out.Attachments[2].Color, "silenced is the neutral grey, not its severity colour")
 
 	calls := env.am.calls()
 	require.Len(t, calls, 1)
@@ -102,11 +105,8 @@ func TestListAlertsTool(t *testing.T) {
 	assert.Equal(t, "Bearer "+testBearerToken, calls[0].Auth)
 
 	// member reads the alerts channel only: the db receiver's alerts are left out.
-	out = decodeResult[alertsResult](t, env.tool(member, toolListAlerts, map[string]any{}))
-	require.Len(t, out.Alerts, 2)
-	for _, a := range out.Alerts {
-		assert.Equal(t, []string{"antimatter"}, a.Receivers)
-	}
+	out = decodeResult[toolDisplayResult](t, env.tool(member, toolListAlerts, map[string]any{}))
+	require.Len(t, out.Attachments, 2)
 
 	// Naming a receiver one can't see is the same as naming one that doesn't exist.
 	hidden := env.tool(member, toolListAlerts, map[string]any{"receiver": "db"})
@@ -114,8 +114,8 @@ func TestListAlertsTool(t *testing.T) {
 	assert.Equal(t, errUnknownReceiver.Error(), hidden.Error)
 	assert.Equal(t, hidden.Error, missing.Error)
 
-	out = decodeResult[alertsResult](t, env.tool(dbAdmin, toolListAlerts, map[string]any{"receiver": "db"}))
-	require.Len(t, out.Alerts, 1)
+	out = decodeResult[toolDisplayResult](t, env.tool(dbAdmin, toolListAlerts, map[string]any{"receiver": "db"}))
+	require.Len(t, out.Attachments, 1)
 	last := env.am.calls()[len(env.am.calls())-1]
 	assert.Equal(t, []string{"^(?:db)$"}, last.Query["receiver"])
 
@@ -131,6 +131,54 @@ func TestListAlertsTool(t *testing.T) {
 	assert.NotEmpty(t, env.tool(member, toolListAlerts, map[string]any{"filter": []string{"a\nb"}}).Error)
 }
 
+// TestListAlertsToolNoMatches checks the calm, green "no alerts" attachment, scoped to the one
+// instance looked at.
+func TestListAlertsToolNoMatches(t *testing.T) {
+	env := newTestEnv(t)
+	out := decodeResult[toolDisplayResult](t, env.tool(member, toolListAlerts, map[string]any{}))
+	require.Len(t, out.Attachments, 1)
+	assert.Equal(t, "No alerts for prod.", out.Summary)
+	assert.Equal(t, "No alerts for prod.", out.Attachments[0].Text)
+	assert.Equal(t, "good", out.Attachments[0].Color)
+}
+
+// TestListAlertsToolManyAlertsTrailer checks a result with more than the shown cap gets a
+// trailing "+N more" attachment, and an unsafe (non-http(s)) generator URL is dropped rather than
+// carried into the attachment's link.
+func TestListAlertsToolManyAlertsTrailer(t *testing.T) {
+	env := newTestEnv(t)
+	var alerts []amAlert
+	for i := range maxShownAlertAttachments + 3 {
+		alerts = append(alerts, amAlert{
+			Labels:       map[string]string{"alertname": fmt.Sprintf("Alert%d", i), "instance": "www-1"},
+			Receivers:    []amReceiver{{Name: "antimatter"}},
+			Status:       amAlertStatus{State: "active"},
+			GeneratorURL: "javascript:alert(1)",
+		})
+	}
+	env.am.alerts = alerts
+	out := decodeResult[toolDisplayResult](t, env.tool(member, toolListAlerts, map[string]any{}))
+	require.Len(t, out.Attachments, maxShownAlertAttachments+1)
+	last := out.Attachments[maxShownAlertAttachments]
+	assert.Contains(t, last.Text, "+3 more")
+	for _, a := range out.Attachments[:maxShownAlertAttachments] {
+		assert.Empty(t, a.TitleLink, "an unsafe generator URL must never reach the attachment's link")
+		// No severity label defaults to "info" (never left blank or "unknown").
+		assert.Equal(t, "info", fieldValue(t, a, "Severity"))
+	}
+}
+
+func fieldValue(t *testing.T, a *model.MessageAttachment, title string) string {
+	t.Helper()
+	for _, f := range a.Fields {
+		if f.Title == title {
+			v, _ := f.Value.(string)
+			return v
+		}
+	}
+	return ""
+}
+
 func TestListSilencesTool(t *testing.T) {
 	env := newTestEnv(t)
 	equal := true
@@ -139,14 +187,28 @@ func TestListSilencesTool(t *testing.T) {
 		{ID: "s-2", Status: amSilenceStatus{State: "expired"}, Matchers: []amMatcher{{Name: "alertname", Value: "Old"}}},
 		{ID: "s-3", Status: amSilenceStatus{State: "pending"}, Matchers: []amMatcher{{Name: "instance", Value: "www-.*", IsRegex: true}}, StartsAt: time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC), EndsAt: time.Date(2026, 10, 25, 2, 0, 0, 0, time.UTC)},
 	}
-	out := decodeResult[silencesResult](t, env.tool(member, toolListSilences, map[string]any{"filter": `alertname="HighCPU"`}))
-	assert.Equal(t, "Silences of prod", out.Title)
-	assert.Equal(t, "1 active, 1 pending.", out.Summary)
-	require.Len(t, out.Silences, 2)
-	assert.Equal(t, toolSilence{ID: "s-1", State: "active", Matchers: `alertname="HighCPU"`, EndsAt: "2026-10-24 20:00 UTC", CreatedBy: "@maya", Comment: "deploy"}, out.Silences[0])
-	assert.Equal(t, `instance=~"www-.*"`, out.Silences[1].Matchers)
-	assert.Equal(t, "2026-10-25 00:00 UTC", out.Silences[1].StartsAt)
+	out := decodeResult[toolDisplayResult](t, env.tool(member, toolListSilences, map[string]any{"filter": `alertname="HighCPU"`}))
+	assert.Equal(t, "Silences of prod: 1 active, 1 pending.", out.Summary)
+	require.Len(t, out.Attachments, 1)
+	table := out.Attachments[0]
+	assert.Equal(t, "Silences of prod", table.Title)
+	assert.Contains(t, table.Text, `alertname="HighCPU"`)
+	assert.Contains(t, table.Text, "2026-10-24 20:00 UTC")
+	assert.Contains(t, table.Text, "@maya")
+	assert.Contains(t, table.Text, "deploy")
+	assert.Contains(t, table.Text, `instance=~"www-.*"`)
+	assert.Contains(t, table.Text, "2026-10-25 00:00 UTC")
+	assert.NotContains(t, table.Text, "Old", "the expired silence isn't shown")
 	assert.Equal(t, []string{`alertname="HighCPU"`}, env.am.calls()[0].Query["filter"])
+}
+
+// TestListSilencesToolNoMatches checks the calm "no active silences" attachment.
+func TestListSilencesToolNoMatches(t *testing.T) {
+	env := newTestEnv(t)
+	out := decodeResult[toolDisplayResult](t, env.tool(member, toolListSilences, map[string]any{}))
+	require.Len(t, out.Attachments, 1)
+	assert.Equal(t, "Silences of prod: No active silences.", out.Summary)
+	assert.Equal(t, "good", out.Attachments[0].Color)
 }
 
 func TestCreateSilenceTool(t *testing.T) {
@@ -314,11 +376,11 @@ func TestRouteByNamesIsVisibleToMembers(t *testing.T) {
 
 	for _, userID := range []string{sysadmin, member, channelAdmin} {
 		for _, args := range []map[string]any{{}, {"alertmanager": "prod"}} {
-			alerts := decodeResult[alertsResult](t, env.tool(userID, toolListAlerts, args))
-			assert.Equal(t, "Alerts of prod", alerts.Title)
-			assert.NotEmpty(t, alerts.Alerts)
-			silences := decodeResult[silencesResult](t, env.tool(userID, toolListSilences, args))
-			assert.Equal(t, "Silences of prod", silences.Title)
+			alerts := decodeResult[toolDisplayResult](t, env.tool(userID, toolListAlerts, args))
+			assert.Contains(t, alerts.Summary, "Alerts of prod")
+			assert.NotEmpty(t, alerts.Attachments)
+			silences := decodeResult[toolDisplayResult](t, env.tool(userID, toolListSilences, args))
+			assert.Equal(t, "Silences of prod", silences.Attachments[0].Title)
 		}
 	}
 
@@ -344,8 +406,8 @@ func TestFailedRouteLookupIsNotKept(t *testing.T) {
 	env.api.mu.Lock()
 	env.api.byName["ops/alerts"] = alertsChannel
 	env.api.mu.Unlock()
-	out := decodeResult[alertsResult](t, env.tool(member, toolListAlerts, map[string]any{}))
-	assert.Equal(t, "Alerts of prod", out.Title)
+	out := decodeResult[toolDisplayResult](t, env.tool(member, toolListAlerts, map[string]any{}))
+	assert.Equal(t, "No alerts for prod.", out.Summary)
 }
 
 // The assistant fills the properties named like a host with the host a message names: "is www-1 down?" gives a
@@ -366,13 +428,13 @@ func TestHostIsATargetNotAnInstance(t *testing.T) {
 		}
 	}
 
-	out := decodeResult[alertsResult](t, env.tool(sysadmin, toolListAlerts, map[string]any{"target": "WWW-1"}))
-	require.Len(t, out.Alerts, 1)
-	assert.Equal(t, "HighCPU", out.Alerts[0].Name)
-	assert.Equal(t, "1 firing (1 critical).", out.Summary)
+	out := decodeResult[toolDisplayResult](t, env.tool(sysadmin, toolListAlerts, map[string]any{"target": "WWW-1"}))
+	require.Len(t, out.Attachments, 1)
+	assert.Equal(t, "HighCPU", out.Attachments[0].Title)
+	assert.Equal(t, "Alerts of prod: 1 firing (1 critical).", out.Summary)
 
-	out = decodeResult[alertsResult](t, env.tool(sysadmin, toolListAlerts, map[string]any{"target": "www-9"}))
-	assert.Empty(t, out.Alerts)
+	out = decodeResult[toolDisplayResult](t, env.tool(sysadmin, toolListAlerts, map[string]any{"target": "www-9"}))
+	assert.Equal(t, "No alerts for prod.", out.Summary)
 
 	// An alert without an instance label is about its job.
 	assert.True(t, aboutTarget(map[string]string{"job": "node"}, "node"))
@@ -394,24 +456,24 @@ func TestSeveralInstances(t *testing.T) {
 		Status: amAlertStatus{State: "active"},
 	}}
 
-	out := decodeResult[alertsResult](t, env.tool(member, toolListAlerts, map[string]any{}))
-	assert.Equal(t, "Alerts", out.Title)
+	out := decodeResult[toolDisplayResult](t, env.tool(member, toolListAlerts, map[string]any{}))
+	assert.Contains(t, out.Summary, "Alerts:")
 	byInstance := map[string]int{}
-	for _, a := range out.Alerts {
-		byInstance[a.Instance]++
+	for _, a := range out.Attachments {
+		byInstance[fieldValue(t, a, "Instance")]++
 	}
 	assert.Equal(t, map[string]int{"prod": 2, "staging": 1}, byInstance)
 	require.Len(t, env.am.calls(), 1)
 	require.Len(t, staging.calls(), 1)
 
-	silences := decodeResult[silencesResult](t, env.tool(member, toolListSilences, map[string]any{}))
-	assert.Equal(t, "Silences", silences.Title)
+	silences := decodeResult[toolDisplayResult](t, env.tool(member, toolListSilences, map[string]any{}))
+	assert.Equal(t, "Silences", silences.Attachments[0].Title)
 	require.Len(t, env.am.calls(), 2)
 	require.Len(t, staging.calls(), 2)
 
-	only := decodeResult[alertsResult](t, env.tool(member, toolListAlerts, map[string]any{"alertmanager": "staging"}))
-	assert.Equal(t, "Alerts of staging", only.Title)
-	require.Len(t, only.Alerts, 1)
+	only := decodeResult[toolDisplayResult](t, env.tool(member, toolListAlerts, map[string]any{"alertmanager": "staging"}))
+	assert.Contains(t, only.Summary, "Alerts of staging")
+	require.Len(t, only.Attachments, 1)
 	assert.Len(t, env.am.calls(), 2, "prod isn't asked")
 
 	create := map[string]any{"matchers": []map[string]any{{"name": "alertname", "value": "HighCPU"}}, "duration": "1h", "comment": "x"}
